@@ -10,11 +10,16 @@ import { LensUploader } from './uploader.js';
 export default class GoogleLensExtension extends Extension {
     enable() {
         this._uploader = new LensUploader(this.path);
+        this._lensButtonClickedId = 0;
         this._injectLensButton();
     }
 
     disable() {
         if (this._lensButton) {
+            if (this._lensButtonClickedId) {
+                this._lensButton.disconnect(this._lensButtonClickedId);
+                this._lensButtonClickedId = 0;
+            }
             this._lensButton.destroy();
             this._lensButton = null;
         }
@@ -38,7 +43,7 @@ export default class GoogleLensExtension extends Extension {
             can_focus: true,
         });
         this._lensButton.set_style('margin-left: 10px;');
-        this._lensButton.connect('clicked', () => {
+        this._lensButtonClickedId = this._lensButton.connect('clicked', () => {
             this._handleLensClick().catch(e => {
                 console.error(`Google Lens Search: Error: ${e.message}`);
             });
