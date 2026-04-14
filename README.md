@@ -24,6 +24,10 @@ mkdir -p ~/.local/share/gnome-shell/extensions/shotzy@SamkitJain660.github.io &&
 wget -qO- https://github.com/SamkitJain660/Shotzy/archive/refs/heads/main.tar.gz | \
 tar -xz --strip-components=1 -C ~/.local/share/gnome-shell/extensions/shotzy@SamkitJain660.github.io
 ```
+Compile schemas:
+```bash
+glib-compile-schemas ~/.local/share/gnome-shell/extensions/shotzy@SamkitJain660.github.io/schemas/
+```
 Then restart GNOME Shell and enable the extension:
 ```bash
 gnome-extensions enable shotzy@SamkitJain660.github.io
