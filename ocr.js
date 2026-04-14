@@ -553,6 +553,7 @@ export class ScreenshotOCRController {
         if (!this._activeBoxText)
             return;
 
+        // Direct clipboard access is required to copy OCR results to the user's clipboard.
         const clipboard = St.Clipboard.get_default();
         clipboard.set_text(St.ClipboardType.CLIPBOARD, this._activeBoxText);
         clipboard.set_text(St.ClipboardType.PRIMARY, this._activeBoxText);
