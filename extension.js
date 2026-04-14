@@ -26,8 +26,21 @@ export default class ShotzyExtension extends Extension {
     }
 
     disable() {
+        const ui = Main.screenshotUI;
+        
+        if (ui) {
+            if (this._uiClosedId) {
+                ui.disconnect(this._uiClosedId);
+                this._uiClosedId = 0;
+            }
+            if (ui._areaSelector && this._areaSelectorDragEndedId) {
+                ui._areaSelector.disconnect(this._areaSelectorDragEndedId);
+                this._areaSelectorDragEndedId = 0;
+            }
+            this._unhookScreenshotUI(ui);
+        }
+
         if (this._lensWrapper) {
-            const ui = Main.screenshotUI;
             if (ui && ui._panel) {
                 ui._panel.remove_child(this._lensWrapper);
                 
@@ -84,7 +97,7 @@ export default class ShotzyExtension extends Extension {
 
                 if (ui._shotButton?.checked) {
                     this._ocrController.start(ui).catch(e => {
-                        console.error(`Shotzy: OCR start failed: ${e.message}`);
+                        log(`Shotzy: OCR start failed: ${e.message}`);
                     });
                 } else {
                     this._ocrController.reset();
@@ -112,9 +125,20 @@ export default class ShotzyExtension extends Extension {
         if (ui._areaSelector && !this._areaSelectorDragEndedId) {
             this._areaSelectorDragEndedId = ui._areaSelector.connect('drag-ended', () => {
                 this._ocrController.refineSelection(ui).catch(e => {
-                    console.error(`Shotzy: OCR selection refine failed: ${e.message}`);
+                    log(`Shotzy: OCR selection refine failed: ${e.message}`);
                 });
             });
+        }
+    }
+
+    _unhookScreenshotUI(ui) {
+        if (this._uiOpenOriginal) {
+            ui.open = this._uiOpenOriginal;
+            this._uiOpenOriginal = null;
+        }
+        if (ui._areaSelector && this._areaSelectorUpdateOriginal) {
+            ui._areaSelector._updateSelectionRect = this._areaSelectorUpdateOriginal;
+            this._areaSelectorUpdateOriginal = null;
         }
     }
 
@@ -135,7 +159,7 @@ export default class ShotzyExtension extends Extension {
             this._lensButton.set_style('margin-left: 10px;');
             this._lensButtonClickedId = this._lensButton.connect('clicked', () => {
                 this._handleLensClick().catch(e => {
-                    console.error(`Shotzy Search: Error: ${e.message}`);
+                    log(`Shotzy Search error: ${e.message}`);
                 });
             });
             ui._showPointerButtonContainer.add_child(this._lensButton);
@@ -153,7 +177,7 @@ export default class ShotzyExtension extends Extension {
             });
             this._ocrButtonClickedId = this._ocrButton.connect('clicked', () => {
                 this._handleOCRClick().catch(e => {
-                    console.error(`Shotzy OCR: Error: ${e.message}`);
+                    log(`Shotzy OCR error: ${e.message}`);
                 });
             });
         }
@@ -243,12 +267,12 @@ export default class ShotzyExtension extends Extension {
             if (pixbuf.savev(filename, 'png', [], [])) {
                 Main.notify('Shotzy', 'Uploading screenshot...');
                 this._uploader.upload(filename).catch(e => {
-                    console.error(`Shotzy: Upload error: ${e.message}`);
+                    log(`Shotzy upload error: ${e.message}`);
                     Main.notify('Shotzy', `Upload failed: ${e.message}`);
                 });
             }
         } catch (e) {
-            console.error(`Shotzy Search: Capture error: ${e.message}`);
+            log(`Shotzy capture error: ${e.message}`);
             ui.close();
         }
     }
