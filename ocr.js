@@ -268,8 +268,11 @@ export class ScreenshotOCRController {
     }
 
     async _runSelectionPass(ui, {force = false} = {}) {
-        if (!this._ocrConfig.enabled || !GLib.find_program_in_path('tesseract')) {
-            if (!GLib.find_program_in_path('tesseract'))
+        if (!this._ocrConfig.enabled)
+            return;
+
+        if (!GLib.find_program_in_path('tesseract')) {
+            if (force)
                 Main.notify('Shotzy OCR', 'tesseract is not installed.');
             return;
         }
