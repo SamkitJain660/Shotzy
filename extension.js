@@ -1,25 +1,84 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
 import Clutter from 'gi://Clutter';
+
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import { ScreenshotOCRController } from './ocr.js';
 import { LensUploader } from './uploader.js';
 
+const Tooltip = GObject.registerClass(
+class Tooltip extends St.Label {
+    _init(widget, text) {
+        super._init({
+            text,
+            style_class: 'screenshot-ui-tooltip',
+            visible: false,
+        });
+
+        this._widget = widget;
+
+        // Auto-disconnect tooltip signals with connectObject.
+        widget.connectObject('notify::hover', () => {
+            if (widget.hover)
+                this._show(widget);
+            else
+                this._hide();
+        }, this);
+
+        // Destroy tooltip when its owner disappears.
+        widget.connectObject('destroy', () => this.destroy(), this);
+    }
+
+    _show(widget) {
+        // Use transition delay, not timeout source.
+        const extents = widget.get_transformed_extents();
+        const x = Math.floor(extents.get_x() + (extents.get_width() - this.width) / 2);
+        const y = extents.get_y() + extents.get_height() + 6;
+
+        this.remove_all_transitions();
+        this.set_position(x, y);
+        this.opacity = 0;
+        this.show();
+        this.ease({
+            opacity: 255,
+            delay: 500,
+            duration: 120,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
+    }
+
+    _hide() {
+        this.remove_all_transitions();
+        this.hide();
+    }
+
+    vfunc_destroy() {
+        this._hide();
+        this._widget = null;
+
+        super.vfunc_destroy();
+    }
+});
+
 export default class ShotzyExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
-        this._uploader = new LensUploader(this.path);
-        this._ocrController = new ScreenshotOCRController(this._settings, this);
+        this._uploader = new LensUploader();
+        this._ocrController = new ScreenshotOCRController(this._settings);
         this._lensButtonClickedId = 0;
-        this._ocrButtonClickedId = 0;
+        this._qrButtonClickedId = 0;
         this._uiOpenOriginal = null;
         this._areaSelectorUpdateOriginal = null;
         this._uiClosedId = 0;
         this._areaSelectorDragEndedId = 0;
+        this._tooltips = [];
+        this._overlayMessage = null;
+        this._overlayMessageTimeoutId = 0;
 
         this._hookScreenshotUI();
         this._injectLensButton();
@@ -70,14 +129,21 @@ export default class ShotzyExtension extends Extension {
             this._lensButton = null;
         }
 
-        if (this._ocrButton) {
-            if (this._ocrButtonClickedId) {
-                this._ocrButton.disconnect(this._ocrButtonClickedId);
-                this._ocrButtonClickedId = 0;
+        if (this._qrButton) {
+            if (this._qrButtonClickedId) {
+                this._qrButton.disconnect(this._qrButtonClickedId);
+                this._qrButtonClickedId = 0;
             }
-            this._ocrButton.destroy();
-            this._ocrButton = null;
+            this._qrButton.destroy();
+            this._qrButton = null;
         }
+
+        if (this._tooltips) {
+            this._tooltips.forEach(t => t.destroy());
+            this._tooltips = [];
+        }
+
+        this._destroyOverlayMessage();
 
         this._ocrController?.destroy();
         this._ocrController = null;
@@ -165,23 +231,31 @@ export default class ShotzyExtension extends Extension {
                 });
             });
             ui._showPointerButtonContainer.add_child(this._lensButton);
+
+            const lensTooltip = new Tooltip(this._lensButton, 'Search with Google Lens');
+            ui.add_child(lensTooltip);
+            this._tooltips.push(lensTooltip);
         }
 
-        // 2. Side-bar buttons (Scanner)
-        if (!this._ocrButton) {
-            this._ocrButton = new St.Button({
+        if (!this._qrButton) {
+            this._qrButton = new St.Button({
                 style_class: 'screenshot-ui-show-pointer-button',
                 child: new St.Icon({
-                    icon_name: 'document-properties-symbolic',
+                    icon_name: 'view-grid-symbolic',
                     icon_size: 24,
                 }),
                 can_focus: true,
             });
-            this._ocrButtonClickedId = this._ocrButton.connect('clicked', () => {
-                this._handleOCRClick().catch(e => {
-                    log(`Shotzy OCR error: ${e.message}`);
+            this._qrButton.set_style('margin-top: 10px;');
+            this._qrButtonClickedId = this._qrButton.connect('clicked', () => {
+                this._handleQRClick().catch(e => {
+                    log(`Shotzy QR error: ${e.message}`);
                 });
             });
+
+            const qrTooltip = new Tooltip(this._qrButton, 'Scan QR Code');
+            ui.add_child(qrTooltip);
+            this._tooltips.push(qrTooltip);
         }
 
         if (this._lensWrapper) return;
@@ -204,7 +278,7 @@ export default class ShotzyExtension extends Extension {
         });
         this._lensSideBox.set_style('margin-left: 16px; padding-left: 16px; border-left: 1px solid rgba(255,255,255,0.2);');
 
-        this._lensSideBox.add_child(this._ocrButton);
+        this._lensSideBox.add_child(this._qrButton);
 
         const typeContainer = ui._typeButtonContainer;
         const bottomContainer = ui._bottomRowContainer;
@@ -221,21 +295,6 @@ export default class ShotzyExtension extends Extension {
 
             ui._panel.add_child(this._lensWrapper);
         }
-    }
-
-    async _handleOCRClick() {
-        const ui = Main.screenshotUI;
-        if (!ui?._selectionButton?.checked) {
-            Main.notify('Shotzy OCR', 'Switch to selection mode to rerun OCR.');
-            return;
-        }
-
-        const geometry = ui._getSelectedGeometry(false);
-        if (!geometry || geometry[2] <= 0 || geometry[3] <= 0)
-            return;
-
-        Main.notify('Shotzy OCR', 'Rerunning OCR on the selected area...');
-        await this._ocrController.rerunSelection(ui);
     }
 
     async _handleLensClick() {
@@ -261,6 +320,7 @@ export default class ShotzyExtension extends Extension {
                 null, 0, 0, 1,
                 stream
             );
+            stream.close(null);
 
             ui.close();
 
@@ -272,10 +332,171 @@ export default class ShotzyExtension extends Extension {
                     log(`Shotzy upload error: ${e.message}`);
                     Main.notify('Shotzy', `Upload failed: ${e.message}`);
                 });
+            } else {
+                if (GLib.file_test(filename, GLib.FileTest.EXISTS))
+                    GLib.unlink(filename);
+                Main.notify('Shotzy', 'Failed to prepare screenshot for upload.');
             }
         } catch (e) {
             log(`Shotzy capture error: ${e.message}`);
             ui.close();
+        }
+    }
+
+    async _handleQRClick() {
+        const ui = Main.screenshotUI;
+        if (!ui?._selectionButton?.checked) {
+            Main.notify('Shotzy QR', 'Switch to selection mode to scan QR.');
+            return;
+        }
+
+        if (!GLib.find_program_in_path('zbarimg')) {
+            return;
+        }
+
+        const geometry = ui._getSelectedGeometry(true);
+        if (!geometry || geometry[2] <= 0 || geometry[3] <= 0) {
+            return;
+        }
+        const [x, y, w, h] = geometry;
+
+        const content = ui._stageScreenshot?.get_content();
+        if (!content) return;
+        const texture = content.get_texture();
+
+        const stream = Gio.MemoryOutputStream.new_resizable();
+        const filename = GLib.build_filenamev([GLib.get_tmp_dir(), `shotzy_qr_${Date.now()}.png`]);
+
+        try {
+            const pixbuf = await Shell.Screenshot.composite_to_stream(
+                texture,
+                x, y, w, h,
+                ui._scale,
+                null, 0, 0, 1,
+                stream
+            );
+
+            stream.close(null);
+
+            if (pixbuf.savev(filename, 'png', [], [])) {
+                const subprocess = Gio.Subprocess.new(
+                    ['zbarimg', '--quiet', '--raw', filename],
+                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+                );
+
+                const [stdout, stderr] = await new Promise((resolve, reject) => {
+                    subprocess.communicate_utf8_async(null, null, (proc, res) => {
+                        try {
+                            const [, out, err] = proc.communicate_utf8_finish(res);
+                            resolve([out, err]);
+                        } catch (e) {
+                            reject(e);
+                        }
+                    });
+                });
+
+                GLib.unlink(filename);
+
+                const result = stdout ? stdout.trim() : null;
+                if (result) {
+                    // Copy decoded QR content for reuse.
+                    const clipboard = St.Clipboard.get_default();
+                    clipboard.set_text(St.ClipboardType.CLIPBOARD, result);
+                    Main.notify('Shotzy QR', 'Content copied to clipboard.');
+                    ui.close();
+                } else {
+                    this._showScreenshotMessage('No QR code found in selection.');
+                }
+            } else {
+                if (GLib.file_test(filename, GLib.FileTest.EXISTS))
+                    GLib.unlink(filename);
+                this._showScreenshotMessage('Failed to prepare selection for scanning.');
+            }
+        } catch (e) {
+            log(`Shotzy QR scan error: ${e.message}`);
+            if (GLib.file_test(filename, GLib.FileTest.EXISTS))
+                GLib.unlink(filename);
+            this._showScreenshotMessage(`QR scan failed: ${e.message}`);
+        }
+    }
+
+    _showScreenshotMessage(text) {
+        const ui = Main.screenshotUI;
+        if (!ui)
+            return;
+
+        if (!this._overlayMessage) {
+            this._overlayMessage = new St.Label({
+                visible: false,
+                opacity: 0,
+                reactive: false,
+                style: `
+                    background-color: rgba(28, 30, 34, 0.96);
+                    color: white;
+                    padding: 10px 14px;
+                    border-radius: 999px;
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    font-weight: 600;
+                `,
+            });
+        }
+
+        if (this._overlayMessage.get_parent() !== ui) {
+            this._overlayMessage.get_parent()?.remove_child(this._overlayMessage);
+            ui.add_child(this._overlayMessage);
+        }
+
+        if (this._overlayMessageTimeoutId) {
+            GLib.source_remove(this._overlayMessageTimeoutId);
+            this._overlayMessageTimeoutId = 0;
+        }
+
+        this._overlayMessage.remove_all_transitions();
+        this._overlayMessage.set_text(text);
+        this._overlayMessage.opacity = 0;
+        this._overlayMessage.show();
+
+        const [, naturalWidth] = this._overlayMessage.get_preferred_width(-1);
+        const [, naturalHeight] = this._overlayMessage.get_preferred_height(naturalWidth);
+        const extents = ui._panel?.get_transformed_extents();
+        const x = Math.max(12, Math.round((global.stage.width - naturalWidth) / 2));
+        const y = extents
+            ? Math.max(12, Math.round(extents.get_y() - naturalHeight - 16))
+            : 24;
+
+        this._overlayMessage.set_position(x, y);
+        this._overlayMessage.ease({
+            opacity: 255,
+            duration: 120,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
+
+        this._overlayMessageTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1800, () => {
+            this._overlayMessageTimeoutId = 0;
+
+            if (!this._overlayMessage)
+                return GLib.SOURCE_REMOVE;
+
+            this._overlayMessage.ease({
+                opacity: 0,
+                duration: 120,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onComplete: () => this._overlayMessage?.hide(),
+            });
+
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _destroyOverlayMessage() {
+        if (this._overlayMessageTimeoutId) {
+            GLib.source_remove(this._overlayMessageTimeoutId);
+            this._overlayMessageTimeoutId = 0;
+        }
+
+        if (this._overlayMessage) {
+            this._overlayMessage.destroy();
+            this._overlayMessage = null;
         }
     }
 }

@@ -1,6 +1,7 @@
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
@@ -20,6 +21,50 @@ export default class ShotzyPreferences extends ExtensionPreferences {
         const settings = this.getSettings();
 
         window.set_default_size(720, 640);
+
+        const dependencyPage = new Adw.PreferencesPage({
+            title: 'Status',
+            icon_name: 'dialog-warning-symbolic',
+        });
+        window.add(dependencyPage);
+
+        const dependencyGroup = new Adw.PreferencesGroup({
+            title: 'Runtime Dependencies',
+            description: 'Shotzy depends on external tools for OCR and QR scanning.',
+        });
+        dependencyPage.add(dependencyGroup);
+
+        const missingDependencies = [
+            {
+                program: 'tesseract',
+                title: 'Tesseract is not installed',
+                subtitle: 'OCR highlighting will remain unavailable until the tesseract binary is installed.',
+            },
+            {
+                program: 'zbarimg',
+                title: 'zbarimg is not installed',
+                subtitle: 'QR scanning will remain unavailable until the zbarimg binary is installed.',
+            },
+        ].filter(item => !GLib.find_program_in_path(item.program));
+
+        if (missingDependencies.length === 0) {
+            dependencyGroup.add(new Adw.ActionRow({
+                title: 'All optional dependencies are available',
+                subtitle: 'OCR and QR features are ready to use.',
+            }));
+        } else {
+            for (const item of missingDependencies) {
+                const row = new Adw.ActionRow({
+                    title: item.title,
+                    subtitle: item.subtitle,
+                });
+                row.add_prefix(new Gtk.Image({
+                    icon_name: 'dialog-warning-symbolic',
+                    valign: Gtk.Align.CENTER,
+                }));
+                dependencyGroup.add(row);
+            }
+        }
 
         const stylePage = new Adw.PreferencesPage({
             title: 'Highlighting',

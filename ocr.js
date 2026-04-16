@@ -88,9 +88,8 @@ class OCRHighlightOverlay extends St.DrawingArea {
 });
 
 export class ScreenshotOCRController {
-    constructor(settings = null, extension = null) {
+    constructor(settings = null) {
         this._settings = settings;
-        this._extension = extension;
         this._overlay = null;
         this._hitboxLayer = null;
         this._copyMenu = null;
@@ -241,15 +240,11 @@ export class ScreenshotOCRController {
 
     async start(ui) {
         this.ensureAttached(ui);
-        await this._runSelectionPass(ui, {force: false});
+        await this._runSelectionPass(ui);
     }
 
     async refineSelection(ui) {
-        await this._runSelectionPass(ui, {force: false});
-    }
-
-    async rerunSelection(ui) {
-        await this._runSelectionPass(ui, {force: true});
+        await this._runSelectionPass(ui);
     }
 
     refreshSelection(ui) {
@@ -273,15 +268,12 @@ export class ScreenshotOCRController {
         this._rebuildHitboxes(this._selectionBoxes, selection);
     }
 
-    async _runSelectionPass(ui, {force = false} = {}) {
+    async _runSelectionPass(ui) {
         if (!this._ocrConfig.enabled)
             return;
 
-        if (!GLib.find_program_in_path('tesseract')) {
-            if (force)
-                Main.notify('Shotzy OCR', 'tesseract is not installed.');
+        if (!GLib.find_program_in_path('tesseract'))
             return;
-        }
 
         if (!ui?._selectionButton?.checked)
             return;
@@ -291,7 +283,7 @@ export class ScreenshotOCRController {
         if (!selectionKey)
             return;
 
-        if (!force && selectionKey === this._selectionKey && this._selectionBoxes.length > 0) {
+        if (selectionKey === this._selectionKey && this._selectionBoxes.length > 0) {
             this.refreshSelection(ui);
             return;
         }
@@ -321,7 +313,7 @@ export class ScreenshotOCRController {
             this.refreshSelection(ui);
         } catch (e) {
             if (runId === this._runId)
-                console.error('Shotzy OCR failed: ' + e.message);
+                log('Shotzy OCR failed: ' + e.message);
         } finally {
             if (capture?.path)
                 this._deleteFile(capture.path);
@@ -374,6 +366,7 @@ export class ScreenshotOCRController {
             null, 0, 0, 1,
             stream
         );
+        stream.close(null);
 
         const path = GLib.build_filenamev([
             GLib.get_tmp_dir(),
@@ -500,7 +493,7 @@ export class ScreenshotOCRController {
         try {
             GLib.unlink(path);
         } catch (e) {
-            console.error(`Failed to delete OCR temp file ${path}: ${e.message}`);
+            log(`Failed to delete OCR temp file ${path}: ${e.message}`);
         }
     }
 
@@ -559,7 +552,7 @@ export class ScreenshotOCRController {
         if (!this._activeBoxText)
             return;
 
-        // Direct clipboard access is required to copy OCR results to the user's clipboard.
+        // Copy OCR text for immediate paste.
         const clipboard = St.Clipboard.get_default();
         clipboard.set_text(St.ClipboardType.CLIPBOARD, this._activeBoxText);
         clipboard.set_text(St.ClipboardType.PRIMARY, this._activeBoxText);
@@ -590,8 +583,9 @@ export class ScreenshotOCRController {
         try {
             Gio.app_info_launch_default_for_uri(url, null);
             this._hideCopyMenu();
+            Main.screenshotUI?.close();
         } catch (e) {
-            console.error(`[Shotzy OCR] Failed to open search URL: ${e.message}`);
+            log(`[Shotzy OCR] Failed to open search URL: ${e.message}`);
         }
     }
 

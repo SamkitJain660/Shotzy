@@ -1,6 +1,6 @@
 {
   "name": "Shotzy",
-  "description": "Google Lens Search and OCR features for the GNOME Screenshot tool.",
+  "description": "Google Lens search, OCR, and QR scanning in the GNOME Screenshot tool.",
   "uuid": "shotzy@SamkitJain660.github.io",
   "settings-schema": "org.gnome.shell.extensions.shotzy",
   "shell-version": [
@@ -8,5 +8,5 @@
     "50"
   ],
   "url": "https://github.com/SamkitJain660/Shotzy",
-  "version": 4
+  "version": 3
 }

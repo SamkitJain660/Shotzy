@@ -7,13 +7,16 @@ Image search on Google Lens and OCR directly from the built-in GNOME Screenshot 
 ## Installation
 
 ### Dependency
-Install **Tesseract OCR** before proceeding (if you wish to use OCR):
+Install **Tesseract OCR** and **zbar-tools** before proceeding
+(if you wish to use OCR / QR scanning):
 ```bash
 # Arch
 sudo pacman -S tesseract tesseract-data-eng
+sudo pacman -S zbar
 
 # Ubuntu/Debian
 sudo apt install tesseract-ocr
+sudo apt install zbar-tools
 ```
 
 ---
