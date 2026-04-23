@@ -47,6 +47,11 @@
       <summary>OCR max edge</summary>
       <description>Maximum long edge for the selected-area OCR image.</description>
     </key>
+    <key name="ocr-languages" type="as">
+      <default>['eng']</default>
+      <summary>OCR languages</summary>
+      <description>Tesseract language codes to use for OCR processing.</description>
+    </key>
     <key name="search-engine" type="s">
       <default>'google'</default>
       <summary>Search engine</summary>

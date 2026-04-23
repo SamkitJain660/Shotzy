@@ -23,8 +23,10 @@ const DEFAULT_OCR = {
     enabled: true,
     confidence: 10,
     maxEdge: 2400,
+    languages: ['eng'],
     searchEngine: 'google',
 };
+const TESSDATA_DIR = '/usr/share/tessdata';
 
 const OCRHighlightOverlay = GObject.registerClass(
 class OCRHighlightOverlay extends St.DrawingArea {
@@ -411,8 +413,10 @@ export class ScreenshotOCRController {
     async _runTesseract(imagePath) {
         this._cancelActiveSubprocess();
 
+        const language = _buildTesseractLanguageArgument(this._ocrConfig.languages);
+        const argv = ['tesseract', imagePath, 'stdout', '-l', language, '--psm', '11', 'tsv'];
         const subprocess = Gio.Subprocess.new(
-            ['tesseract', imagePath, 'stdout', '--psm', '11', 'tsv'],
+            argv,
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
         );
         this._subprocess = subprocess;
@@ -629,6 +633,7 @@ export class ScreenshotOCRController {
             enabled: this._settings.get_boolean('ocr-enabled'),
             confidence: _clamp(this._settings.get_int('selection-confidence'), 0, 99),
             maxEdge: _clamp(this._settings.get_int('selection-max-edge'), 800, 4096),
+            languages: _normalizeLanguageSelection(this._settings.get_strv('ocr-languages')),
             searchEngine: this._settings.get_string('search-engine') || 'google',
         };
     }
@@ -654,6 +659,76 @@ function _parseColorSetting(value, fallback) {
         _clamp(parts[2], 0, 1),
         _clamp(parts[3], 0, 1),
     ];
+}
+
+function _buildTesseractLanguageArgument(languages) {
+    return _normalizeLanguageSelection(languages, _listInstalledTesseractLanguages()).join('+');
+}
+
+function _listInstalledTesseractLanguages() {
+    const directory = Gio.File.new_for_path(TESSDATA_DIR);
+    const languages = [];
+    let enumerator = null;
+
+    try {
+        enumerator = directory.enumerate_children(
+            'standard::name,standard::type',
+            Gio.FileQueryInfoFlags.NONE,
+            null
+        );
+
+        let info;
+        while ((info = enumerator.next_file(null)) !== null) {
+            if (info.get_file_type() !== Gio.FileType.REGULAR)
+                continue;
+
+            const name = info.get_name();
+            if (!name.endsWith('.traineddata'))
+                continue;
+
+            const code = name.slice(0, -'.traineddata'.length);
+            if (/^[A-Za-z0-9_]+$/.test(code))
+                languages.push(code);
+        }
+    } catch (_e) {
+    } finally {
+        try {
+            enumerator?.close(null);
+        } catch (_e) {
+        }
+    }
+
+    return languages.sort();
+}
+
+function _normalizeLanguageSelection(languages, installedLanguages = null) {
+    const installed = installedLanguages?.length > 0 ? new Set(installedLanguages) : null;
+    const normalized = [];
+    const seen = new Set();
+
+    if (!Array.isArray(languages))
+        languages = [];
+
+    for (const language of languages) {
+        const code = String(language).trim();
+        if (!code || !/^[A-Za-z0-9_]+$/.test(code) || seen.has(code))
+            continue;
+
+        if (installed && !installed.has(code))
+            continue;
+
+        normalized.push(code);
+        seen.add(code);
+    }
+
+    if (normalized.length > 0)
+        return normalized;
+
+    const fallback = DEFAULT_OCR.languages.find(language => !installed || installed.has(language));
+    if (fallback)
+        return [fallback];
+
+    return installedLanguages?.length > 0 ? [installedLanguages[0]] : [...DEFAULT_OCR.languages];
 }
 
 function _clamp(value, min, max) {

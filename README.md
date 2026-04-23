@@ -18,6 +18,9 @@ sudo pacman -S zbar
 sudo apt install tesseract-ocr
 sudo apt install zbar-tools
 ```
+Shotzy detects installed OCR languages from `/usr/share/tessdata`.
+
+[Install](https://github.com/tesseract-ocr/tessdata/tree/main) extra Tesseract language packs to make them selectable in the OCR settings.
 
 ---
 
@@ -41,4 +44,3 @@ Then restart GNOME Shell and enable the extension:
 ```bash
 gnome-extensions enable shotzy@SamkitJain660.github.io
 ```
-
