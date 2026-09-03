@@ -6,6 +6,13 @@ import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+import {
+    TESSDATA_DIR,
+    invalidateInstalledTesseractLanguages,
+    listInstalledTesseractLanguages,
+    normalizeLanguageSelection,
+} from './util.js';
+
 const COLOR_KEYS = {
     'highlight-fill-color': 'Fill color',
     'highlight-border-color': 'Border color',
@@ -16,14 +23,14 @@ const DEFAULTS = {
     'highlight-border-color': '0.92,0.94,0.97,0.34',
 };
 
-const TESSDATA_DIR = GLib.getenv('TESSDATA_PREFIX') || '/usr/share/tessdata';
-const DEFAULT_OCR_LANGUAGES = ['eng'];
-const HIDDEN_TESSERACT_LANGUAGES = new Set(['osd']);
 export default class ShotzyPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
         const dependencyState = this._getDependencyState();
-        const tesseractLanguages = _listInstalledTesseractLanguages();
+
+        // Rescan on every window, so packs installed since the last one show up.
+        invalidateInstalledTesseractLanguages();
+        const tesseractLanguages = listInstalledTesseractLanguages();
 
         window.set_default_size(720, 640);
 
@@ -240,7 +247,8 @@ export default class ShotzyPreferences extends ExtensionPreferences {
         if (installedLanguages.length === 0) {
             const row = new Adw.ActionRow({
                 title: 'OCR languages',
-                subtitle: `No Tesseract language data found in ${TESSDATA_DIR}.`,
+                subtitle: `No Tesseract language data in ${TESSDATA_DIR}. ` +
+                    'Install a language pack, or point TESSDATA_PREFIX at it.',
             });
             row.add_prefix(new Gtk.Image({
                 icon_name: 'dialog-warning-symbolic',
@@ -251,11 +259,12 @@ export default class ShotzyPreferences extends ExtensionPreferences {
 
         const row = new Adw.ExpanderRow({
             title: 'OCR languages',
+            subtitle: `Detected in ${TESSDATA_DIR}.`,
         });
 
         const switches = new Map();
         const updateRows = () => {
-            const selected = new Set(_normalizeLanguageSelection(settings.get_strv('ocr-languages'), installedLanguages));
+            const selected = new Set(normalizeLanguageSelection(settings.get_strv('ocr-languages'), installedLanguages));
 
             for (const [code, switchRow] of switches)
                 switchRow.active = selected.has(code);
@@ -265,19 +274,19 @@ export default class ShotzyPreferences extends ExtensionPreferences {
             const switchRow = new Adw.SwitchRow({
                 title: language,
             });
-            switchRow.active = _normalizeLanguageSelection(
+            switchRow.active = normalizeLanguageSelection(
                 settings.get_strv('ocr-languages'),
                 installedLanguages
             ).includes(language);
 
             switchRow.connect('notify::active', () => {
-                const selected = new Set(_normalizeLanguageSelection(settings.get_strv('ocr-languages'), installedLanguages));
+                const selected = new Set(normalizeLanguageSelection(settings.get_strv('ocr-languages'), installedLanguages));
                 if (switchRow.active)
                     selected.add(language);
                 else
                     selected.delete(language);
 
-                settings.set_strv('ocr-languages', _normalizeLanguageSelection([...selected], installedLanguages));
+                settings.set_strv('ocr-languages', normalizeLanguageSelection([...selected], installedLanguages));
             });
 
             switches.set(language, switchRow);
@@ -375,70 +384,4 @@ function _rgbaToSetting(rgba) {
         rgba.blue.toFixed(3),
         rgba.alpha.toFixed(3),
     ].join(',');
-}
-
-function _listInstalledTesseractLanguages() {
-    const directory = Gio.File.new_for_path(TESSDATA_DIR);
-    const languages = [];
-    let enumerator = null;
-
-    try {
-        enumerator = directory.enumerate_children(
-            'standard::name,standard::type',
-            Gio.FileQueryInfoFlags.NONE,
-            null
-        );
-
-        let info;
-        while ((info = enumerator.next_file(null)) !== null) {
-            if (info.get_file_type() !== Gio.FileType.REGULAR)
-                continue;
-
-            const name = info.get_name();
-            if (!name.endsWith('.traineddata'))
-                continue;
-
-            const code = name.slice(0, -'.traineddata'.length);
-            if (/^[A-Za-z0-9_]+$/.test(code) && !HIDDEN_TESSERACT_LANGUAGES.has(code))
-                languages.push(code);
-        }
-    } catch (_e) {
-    } finally {
-        try {
-            enumerator?.close(null);
-        } catch (_e) {
-        }
-    }
-
-    return languages.sort();
-}
-
-function _normalizeLanguageSelection(languages, installedLanguages = null) {
-    const installed = installedLanguages ? new Set(installedLanguages) : null;
-    const normalized = [];
-    const seen = new Set();
-
-    if (!Array.isArray(languages))
-        languages = [];
-
-    for (const language of languages) {
-        const code = String(language).trim();
-        if (!code || !/^[A-Za-z0-9_]+$/.test(code) || seen.has(code))
-            continue;
-
-        if (installed && !installed.has(code))
-            continue;
-
-        normalized.push(code);
-        seen.add(code);
-    }
-
-    if (normalized.length > 0)
-        return normalized;
-
-    const fallback = DEFAULT_OCR_LANGUAGES.find(language => !installed || installed.has(language));
-    if (fallback)
-        return [fallback];
-
-    return installedLanguages?.length > 0 ? [installedLanguages[0]] : [...DEFAULT_OCR_LANGUAGES];
 }
