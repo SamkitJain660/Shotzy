@@ -1,7 +1,24 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 
+import { deleteFile, tempFilePath, writePrivateFile } from './util.js';
+
+const LAUNCHER_LIFETIME_SECONDS = 60;
+
 export class LensUploader {
+    constructor() {
+        // path -> GLib source id, so pending cleanups can be flushed on disable.
+        this._pendingCleanups = new Map();
+    }
+
+    destroy() {
+        for (const [path, sourceId] of this._pendingCleanups) {
+            GLib.source_remove(sourceId);
+            deleteFile(path);
+        }
+        this._pendingCleanups.clear();
+    }
+
     async upload(filePath) {
         const file = Gio.File.new_for_path(filePath);
         let launcherPath = null;
@@ -27,10 +44,7 @@ export class LensUploader {
             const mimeType = Gio.content_type_get_mime_type(guessedType) ?? 'application/octet-stream';
             const imageDataUrl = `data:${mimeType};base64,${GLib.base64_encode(contents)}`;
 
-            launcherPath = GLib.build_filenamev([
-                GLib.get_tmp_dir(),
-                `shotzy_upload_${GLib.uuid_string_random()}.html`,
-            ]);
+            launcherPath = tempFilePath('shotzy_upload', 'html');
 
             const launcherHtml = `<!doctype html>
 <html lang="en">
@@ -84,38 +98,31 @@ export class LensUploader {
 </body>
 </html>`;
 
-            GLib.file_set_contents(launcherPath, launcherHtml);
+            // The launcher embeds the screenshot, so keep it out of other users' reach.
+            writePrivateFile(launcherPath, new TextEncoder().encode(launcherHtml));
 
             const launcherFile = Gio.File.new_for_path(launcherPath);
             Gio.AppInfo.launch_default_for_uri(launcherFile.get_uri(), null);
 
-            this._scheduleDelete(launcherPath, 60);
+            this._scheduleDelete(launcherPath, LAUNCHER_LIFETIME_SECONDS);
         } catch (e) {
             if (launcherPath)
-                this._deleteFile(launcherPath);
+                deleteFile(launcherPath);
 
-            log(`Shotzy upload failed: ${e.message}`);
+            console.error(`Shotzy upload failed: ${e.message}`);
             throw e;
         } finally {
-            this._deleteFile(filePath);
+            deleteFile(filePath);
         }
     }
 
     _scheduleDelete(path, delaySeconds) {
-        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, delaySeconds, () => {
-            this._deleteFile(path);
+        const sourceId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, delaySeconds, () => {
+            this._pendingCleanups.delete(path);
+            deleteFile(path);
             return GLib.SOURCE_REMOVE;
         });
-    }
 
-    _deleteFile(path) {
-        if (!path || !GLib.file_test(path, GLib.FileTest.EXISTS))
-            return;
-
-        try {
-            GLib.unlink(path);
-        } catch (e) {
-            log(`Shotzy cleanup failed for ${path}: ${e.message}`);
-        }
+        this._pendingCleanups.set(path, sourceId);
     }
 }

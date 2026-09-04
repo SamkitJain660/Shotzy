@@ -10,6 +10,7 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import { ScreenshotOCRController } from './ocr.js';
 import { LensUploader } from './uploader.js';
+import { deleteFile, savePixbufPrivately, tempFilePath } from './util.js';
 
 const Tooltip = GObject.registerClass(
 class Tooltip extends St.Label {
@@ -35,15 +36,17 @@ class Tooltip extends St.Label {
     }
 
     _show(widget) {
-        // Use transition delay, not timeout source.
+        // Preferred width, not `this.width`: the latter is 0 before the first allocation.
+        const [, tooltipWidth] = this.get_preferred_width(-1);
         const extents = widget.get_transformed_extents();
-        const x = Math.floor(extents.get_x() + (extents.get_width() - this.width) / 2);
+        const x = Math.floor(extents.get_x() + (extents.get_width() - tooltipWidth) / 2);
         const y = extents.get_y() + extents.get_height() + 6;
 
         this.remove_all_transitions();
         this.set_position(x, y);
         this.opacity = 0;
         this.show();
+        // Use transition delay, not a timeout source.
         this.ease({
             opacity: 255,
             delay: 500,
@@ -107,26 +110,12 @@ export default class ShotzyExtension extends Extension {
             this._unhookScreenshotUI(ui);
         }
 
-        if (this._lensWrapper) {
-            if (ui && ui._panel) {
-                ui._panel.remove_child(this._lensWrapper);
-                
-                if (ui._typeButtonContainer && ui._bottomRowContainer) {
-                    if (this._lensInnerVBox) {
-                        this._lensInnerVBox.remove_child(ui._typeButtonContainer);
-                        this._lensInnerVBox.remove_child(ui._bottomRowContainer);
-                    }
-                    ui._panel.add_child(ui._typeButtonContainer);
-                    ui._panel.add_child(ui._bottomRowContainer);
-                }
-            }
-            this._lensInnerVBox?.destroy();
-            this._lensInnerVBox = null;
-            this._lensSideBox?.destroy();
-            this._lensSideBox = null;
-            this._lensWrapper.destroy();
-            this._lensWrapper = null;
-        }
+        // Reuse the QR-toggle teardown so the panel is reassembled the same way.
+        this._restoreDefaultLayout(ui);
+
+        // Before the buttons: a tooltip also self-destructs with its button.
+        this._tooltips.forEach(tooltip => tooltip.destroy());
+        this._tooltips = [];
 
         if (this._lensButton) {
             if (this._lensButtonClickedId) {
@@ -146,11 +135,6 @@ export default class ShotzyExtension extends Extension {
             this._qrButton = null;
         }
 
-        if (this._tooltips) {
-            this._tooltips.forEach(t => t.destroy());
-            this._tooltips = [];
-        }
-
         this._destroyOverlayMessage();
 
         if (this._settings && this._settingsChangedId) {
@@ -160,8 +144,9 @@ export default class ShotzyExtension extends Extension {
 
         this._ocrController?.destroy();
         this._ocrController = null;
-        this._settings = null;
+        this._uploader?.destroy();
         this._uploader = null;
+        this._settings = null;
     }
 
     _hookScreenshotUI() {
@@ -178,7 +163,7 @@ export default class ShotzyExtension extends Extension {
 
                 if (ui._shotButton?.checked) {
                     this._ocrController.start(ui).catch(e => {
-                        log(`Shotzy: OCR start failed: ${e.message}`);
+                        console.error(`Shotzy: OCR start failed: ${e.message}`);
                     });
                 } else {
                     this._ocrController.reset();
@@ -206,7 +191,7 @@ export default class ShotzyExtension extends Extension {
         if (ui._areaSelector && !this._areaSelectorDragEndedId) {
             this._areaSelectorDragEndedId = ui._areaSelector.connect('drag-ended', () => {
                 this._ocrController.refineSelection(ui).catch(e => {
-                    log(`Shotzy: OCR selection refine failed: ${e.message}`);
+                    console.error(`Shotzy: OCR selection refine failed: ${e.message}`);
                 });
             });
         }
@@ -235,11 +220,12 @@ export default class ShotzyExtension extends Extension {
                     icon_size: 24,
                 }),
                 can_focus: true,
+                accessible_name: 'Search with Google Lens',
             });
             this._lensButton.set_style('margin-left: 10px;');
             this._lensButtonClickedId = this._lensButton.connect('clicked', () => {
                 this._handleLensClick().catch(e => {
-                    log(`Shotzy Search error: ${e.message}`);
+                    console.error(`Shotzy search error: ${e.message}`);
                 });
             });
             ui._showPointerButtonContainer.add_child(this._lensButton);
@@ -257,11 +243,12 @@ export default class ShotzyExtension extends Extension {
                     icon_size: 24,
                 }),
                 can_focus: true,
+                accessible_name: 'Scan QR code',
             });
             this._qrButton.set_style('margin-top: 10px;');
             this._qrButtonClickedId = this._qrButton.connect('clicked', () => {
                 this._handleQRClick().catch(e => {
-                    log(`Shotzy QR error: ${e.message}`);
+                    console.error(`Shotzy QR error: ${e.message}`);
                 });
             });
 
@@ -354,8 +341,10 @@ export default class ShotzyExtension extends Extension {
         if (!this._lensWrapper)
             return;
 
-        if (ui._panel) {
-            ui._panel.remove_child(this._lensWrapper);
+        const panel = ui?._panel ?? null;
+        if (panel) {
+            if (this._lensWrapper.get_parent() === panel)
+                panel.remove_child(this._lensWrapper);
 
             const typeContainer = ui._typeButtonContainer;
             const bottomContainer = ui._bottomRowContainer;
@@ -368,8 +357,10 @@ export default class ShotzyExtension extends Extension {
                         this._lensInnerVBox.remove_child(bottomContainer);
                 }
 
-                ui._panel.add_child(typeContainer);
-                ui._panel.add_child(bottomContainer);
+                if (!typeContainer.get_parent())
+                    panel.add_child(typeContainer);
+                if (!bottomContainer.get_parent())
+                    panel.add_child(bottomContainer);
             }
         }
 
@@ -411,21 +402,20 @@ export default class ShotzyExtension extends Extension {
 
             ui.close();
 
-            const filename = GLib.build_filenamev([GLib.get_tmp_dir(), `shotzy_${Date.now()}.png`]);
-            
-            if (pixbuf.savev(filename, 'png', [], [])) {
+            const filename = tempFilePath('shotzy');
+
+            if (savePixbufPrivately(pixbuf, filename)) {
                 Main.notify('Shotzy', 'Uploading screenshot...');
                 this._uploader.upload(filename).catch(e => {
-                    log(`Shotzy upload error: ${e.message}`);
+                    console.error(`Shotzy upload error: ${e.message}`);
                     Main.notify('Shotzy', `Upload failed: ${e.message}`);
                 });
             } else {
-                if (GLib.file_test(filename, GLib.FileTest.EXISTS))
-                    GLib.unlink(filename);
+                deleteFile(filename);
                 Main.notify('Shotzy', 'Failed to prepare screenshot for upload.');
             }
         } catch (e) {
-            log(`Shotzy capture error: ${e.message}`);
+            console.error(`Shotzy capture error: ${e.message}`);
             ui.close();
         }
     }
@@ -438,11 +428,13 @@ export default class ShotzyExtension extends Extension {
         }
 
         if (!GLib.find_program_in_path('zbarimg')) {
+            this._showScreenshotMessage('Install zbar-tools to scan QR codes.');
             return;
         }
 
         const geometry = ui._getSelectedGeometry(true);
         if (!geometry || geometry[2] <= 0 || geometry[3] <= 0) {
+            this._showScreenshotMessage('Select an area to scan.');
             return;
         }
         const [x, y, w, h] = geometry;
@@ -452,7 +444,7 @@ export default class ShotzyExtension extends Extension {
         const texture = content.get_texture();
 
         const stream = Gio.MemoryOutputStream.new_resizable();
-        const filename = GLib.build_filenamev([GLib.get_tmp_dir(), `shotzy_qr_${Date.now()}.png`]);
+        const filename = tempFilePath('shotzy_qr');
 
         try {
             const pixbuf = await Shell.Screenshot.composite_to_stream(
@@ -465,7 +457,7 @@ export default class ShotzyExtension extends Extension {
 
             stream.close(null);
 
-            if (pixbuf.savev(filename, 'png', [], [])) {
+            if (savePixbufPrivately(pixbuf, filename)) {
                 const subprocess = Gio.Subprocess.new(
                     ['zbarimg', '--quiet', '--raw', filename],
                     Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
@@ -482,7 +474,7 @@ export default class ShotzyExtension extends Extension {
                     });
                 });
 
-                GLib.unlink(filename);
+                deleteFile(filename);
 
                 const result = stdout ? stdout.trim() : null;
                 if (result) {
@@ -495,14 +487,12 @@ export default class ShotzyExtension extends Extension {
                     this._showScreenshotMessage('No QR code found in selection.');
                 }
             } else {
-                if (GLib.file_test(filename, GLib.FileTest.EXISTS))
-                    GLib.unlink(filename);
+                deleteFile(filename);
                 this._showScreenshotMessage('Failed to prepare selection for scanning.');
             }
         } catch (e) {
-            log(`Shotzy QR scan error: ${e.message}`);
-            if (GLib.file_test(filename, GLib.FileTest.EXISTS))
-                GLib.unlink(filename);
+            console.error(`Shotzy QR scan error: ${e.message}`);
+            deleteFile(filename);
             this._showScreenshotMessage(`QR scan failed: ${e.message}`);
         }
     }
@@ -545,11 +535,15 @@ export default class ShotzyExtension extends Extension {
 
         const [, naturalWidth] = this._overlayMessage.get_preferred_width(-1);
         const [, naturalHeight] = this._overlayMessage.get_preferred_height(naturalWidth);
+        // Centre on the monitor the screenshot HUD is on, not across the whole stage.
         const extents = ui._panel?.get_transformed_extents();
-        const x = Math.max(12, Math.round((global.stage.width - naturalWidth) / 2));
+        const monitor = _monitorForExtents(extents);
+        const x = monitor
+            ? Math.max(monitor.x + 12, Math.round(monitor.x + (monitor.width - naturalWidth) / 2))
+            : Math.max(12, Math.round((global.stage.width - naturalWidth) / 2));
         const y = extents
             ? Math.max(12, Math.round(extents.get_y() - naturalHeight - 16))
-            : 24;
+            : (monitor?.y ?? 0) + 24;
 
         this._overlayMessage.set_position(x, y);
         this._overlayMessage.ease({
@@ -586,4 +580,21 @@ export default class ShotzyExtension extends Extension {
             this._overlayMessage = null;
         }
     }
+}
+
+function _monitorForExtents(extents) {
+    const monitors = Main.layoutManager?.monitors ?? [];
+
+    if (extents) {
+        const centerX = extents.get_x() + extents.get_width() / 2;
+        const centerY = extents.get_y() + extents.get_height() / 2;
+        const found = monitors.find(monitor =>
+            centerX >= monitor.x && centerX < monitor.x + monitor.width &&
+            centerY >= monitor.y && centerY < monitor.y + monitor.height);
+
+        if (found)
+            return found;
+    }
+
+    return Main.layoutManager?.primaryMonitor ?? null;
 }

@@ -9,6 +9,15 @@ import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+import {
+    deleteFile,
+    invalidateInstalledTesseractLanguages,
+    listInstalledTesseractLanguages,
+    normalizeLanguageSelection,
+    savePixbufPrivately,
+    tempFilePath,
+} from './util.js';
+
 const DEFAULT_STYLE = {
     fill: [0.10, 0.11, 0.13, 0.34],
     border: [0.92, 0.94, 0.97, 0.34],
@@ -27,7 +36,23 @@ const DEFAULT_OCR = {
     searchEngine: 'google',
     closeAfterCopy: false,
 };
-const TESSDATA_DIR = GLib.getenv('TESSDATA_PREFIX') || '/usr/share/tessdata';
+// Settings that change what tesseract produces, as opposed to how it is drawn.
+const OCR_INPUT_KEYS = new Set([
+    'ocr-enabled',
+    'selection-confidence',
+    'selection-max-edge',
+    'ocr-languages',
+]);
+
+// undefined until looked up; null when tesseract is not installed.
+let tesseractPath;
+
+function _findTesseract() {
+    if (tesseractPath === undefined)
+        tesseractPath = GLib.find_program_in_path('tesseract');
+
+    return tesseractPath;
+}
 
 const OCRHighlightOverlay = GObject.registerClass(
 class OCRHighlightOverlay extends St.DrawingArea {
@@ -107,19 +132,31 @@ export class ScreenshotOCRController {
         this._settingsChangedId = 0;
         this._style = DEFAULT_STYLE;
         this._ocrConfig = DEFAULT_OCR;
+        this._missingTesseractReported = false;
 
         if (this._settings) {
             this._reloadSettings();
-            this._settingsChangedId = this._settings.connect('changed', () => {
+            this._settingsChangedId = this._settings.connect('changed', (_settings, key) => {
                 this._reloadSettings();
 
                 if (this._overlay)
                     this._overlay.setStyle(this._style);
 
-                if (!this._ocrConfig.enabled)
+                if (!this._ocrConfig.enabled) {
                     this.reset();
-                else
-                    this.refreshSelection(Main.screenshotUI);
+                    return;
+                }
+
+                if (OCR_INPUT_KEYS.has(key)) {
+                    // Recognition inputs changed, so the cached boxes are stale.
+                    this._selectionKey = null;
+                    this.refineSelection(Main.screenshotUI).catch(e => {
+                        console.error(`Shotzy: OCR refresh failed: ${e.message}`);
+                    });
+                    return;
+                }
+
+                this.refreshSelection(Main.screenshotUI);
             });
         }
     }
@@ -204,6 +241,7 @@ export class ScreenshotOCRController {
             });
             this._copyButton = new St.Button({
                 label: 'Copy',
+                accessible_name: 'Copy recognised text',
                 can_focus: true,
                 y_align: Clutter.ActorAlign.CENTER,
                 style: `
@@ -220,6 +258,7 @@ export class ScreenshotOCRController {
 
             this._searchButton = new St.Button({
                 label: 'Search',
+                accessible_name: 'Search for recognised text',
                 can_focus: true,
                 y_align: Clutter.ActorAlign.CENTER,
                 style: `
@@ -243,6 +282,11 @@ export class ScreenshotOCRController {
     }
 
     async start(ui) {
+        // A new screenshot session is the natural moment to notice a tesseract
+        // or language pack that was installed since the last one.
+        tesseractPath = undefined;
+        invalidateInstalledTesseractLanguages();
+
         this.ensureAttached(ui);
         await this._runSelectionPass(ui);
     }
@@ -276,11 +320,13 @@ export class ScreenshotOCRController {
         if (!this._ocrConfig.enabled)
             return;
 
-        if (!GLib.find_program_in_path('tesseract'))
-            return;
-
         if (!ui?._selectionButton?.checked)
             return;
+
+        if (!_findTesseract()) {
+            this._warnMissingTesseract();
+            return;
+        }
 
         const selection = this._getSelectionGeometry(ui);
         const selectionKey = this._makeSelectionKey(selection);
@@ -317,11 +363,19 @@ export class ScreenshotOCRController {
             this.refreshSelection(ui);
         } catch (e) {
             if (runId === this._runId)
-                log('Shotzy OCR failed: ' + e.message);
+                console.error(`Shotzy: OCR failed: ${e.message}`);
         } finally {
             if (capture?.path)
-                this._deleteFile(capture.path);
+                deleteFile(capture.path);
         }
+    }
+
+    _warnMissingTesseract() {
+        if (this._missingTesseractReported)
+            return;
+
+        this._missingTesseractReported = true;
+        this._showMessage?.('Install tesseract to highlight and copy text.');
     }
 
     _getSelectionGeometry(ui) {
@@ -372,10 +426,7 @@ export class ScreenshotOCRController {
         );
         stream.close(null);
 
-        const path = GLib.build_filenamev([
-            GLib.get_tmp_dir(),
-            `shotzy_ocr_${Date.now()}_${GLib.uuid_string_random()}.png`,
-        ]);
+        const path = tempFilePath('shotzy_ocr');
 
         const sourceWidth = pixbuf.get_width();
         const sourceHeight = pixbuf.get_height();
@@ -395,7 +446,7 @@ export class ScreenshotOCRController {
             );
         }
 
-        if (!savedPixbuf || !savedPixbuf.savev(path, 'png', [], []))
+        if (!savedPixbuf || !savePixbufPrivately(savedPixbuf, path))
             throw new Error('Failed to save OCR screenshot');
 
         return {
@@ -415,7 +466,7 @@ export class ScreenshotOCRController {
         this._cancelActiveSubprocess();
 
         const language = _buildTesseractLanguageArgument(this._ocrConfig.languages);
-        const argv = ['tesseract', imagePath, 'stdout', '-l', language, '--psm', '11', 'tsv'];
+        const argv = [_findTesseract() ?? 'tesseract', imagePath, 'stdout', '-l', language, '--psm', '11', 'tsv'];
         const subprocess = Gio.Subprocess.new(
             argv,
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
@@ -495,14 +546,6 @@ export class ScreenshotOCRController {
         ].join(':');
     }
 
-    _deleteFile(path) {
-        try {
-            GLib.unlink(path);
-        } catch (e) {
-            log(`Failed to delete OCR temp file ${path}: ${e.message}`);
-        }
-    }
-
     _rebuildHitboxes(boxes, selection = null) {
         if (!this._hitboxLayer)
             return;
@@ -512,16 +555,15 @@ export class ScreenshotOCRController {
         if (boxes.length === 0 || !selection)
             return;
 
+        // Words share a line when their vertical extents overlap. Comparing the
+        // signed drop instead would join a column break, where the next word
+        // starts higher up the screen, onto the previous line.
         let fullText = '';
         let lastBox = null;
         for (const box of boxes) {
-            if (lastBox) {
-                if (box.y - lastBox.y > lastBox.height * 0.5) {
-                    fullText += '\n';
-                } else {
-                    fullText += ' ';
-                }
-            }
+            if (lastBox)
+                fullText += _onSameTextLine(lastBox, box) ? ' ' : '\n';
+
             fullText += box.text;
             lastBox = box;
         }
@@ -533,24 +575,26 @@ export class ScreenshotOCRController {
         const menuWidth = naturalWidth || 200;
         const menuHeight = naturalHeight || 44;
 
+        // Keep the menu on the monitor holding the selection; clamping to the
+        // stage would push it onto a neighbouring screen in a multi-monitor setup.
         const margin = 12;
-        const stageWidth = global.stage.width;
-        const stageHeight = global.stage.height;
+        const area = _monitorForPoint(
+            selection.x + selection.width / 2,
+            selection.y + selection.height / 2
+        );
+        const minX = area.x + margin;
+        const minY = area.y + margin;
+        const maxX = area.x + area.width - menuWidth - margin;
+        const maxY = area.y + area.height - menuHeight - margin;
 
         const centerX = selection.x + selection.width / 2;
-        const clampedCenterX = Math.max(
-            margin,
-            Math.min(stageWidth - menuWidth - margin, Math.round(centerX - menuWidth / 2))
-        );
+        const clampedCenterX = Math.max(minX, Math.min(maxX, Math.round(centerX - menuWidth / 2)));
 
         const centerY = selection.y + selection.height / 2;
-        const clampedCenterY = Math.max(
-            margin,
-            Math.min(stageHeight - menuHeight - margin, Math.round(centerY - menuHeight / 2))
-        );
+        const clampedCenterY = Math.max(minY, Math.min(maxY, Math.round(centerY - menuHeight / 2)));
 
         // Prefer below the selection, then above, then to either side, skipping
-        // any spot that runs off-screen or collides with the screenshot HUD.
+        // any spot that runs off the monitor or collides with the screenshot HUD.
         const blocker = this._getHudRect(margin);
         const candidates = [
             {x: clampedCenterX, y: Math.round(selection.y + selection.height + margin)},
@@ -561,24 +605,25 @@ export class ScreenshotOCRController {
 
         let placement = null;
         for (const candidate of candidates) {
-            const rect = {x: candidate.x, y: candidate.y, width: menuWidth, height: menuHeight};
-            if (rect.x < margin || rect.y < margin ||
-                rect.x + menuWidth > stageWidth - margin ||
-                rect.y + menuHeight > stageHeight - margin)
+            if (candidate.x < minX || candidate.x > maxX ||
+                candidate.y < minY || candidate.y > maxY)
                 continue;
+
+            const rect = {x: candidate.x, y: candidate.y, width: menuWidth, height: menuHeight};
             if (blocker && _rectsOverlap(rect, blocker))
                 continue;
+
             placement = candidate;
             break;
         }
 
         if (!placement) {
-            // Nothing was fully clear; fall back to below/above on-screen.
+            // Nothing was fully clear; fall back to below, else above, on-monitor.
             const belowY = Math.round(selection.y + selection.height + margin);
             const aboveY = Math.round(selection.y - menuHeight - margin);
-            const y = belowY + menuHeight <= stageHeight - margin
+            const y = belowY <= maxY
                 ? belowY
-                : Math.max(margin, aboveY);
+                : Math.max(minY, Math.min(maxY, aboveY));
             placement = {x: clampedCenterX, y};
         }
 
@@ -620,7 +665,7 @@ export class ScreenshotOCRController {
         clipboard.set_text(St.ClipboardType.PRIMARY, this._activeBoxText);
         this._hideCopyMenu();
         if (this._showMessage)
-            this._showMessage('copied OCR text');
+            this._showMessage('Copied OCR text');
         else
             Main.notify('Shotzy OCR', 'Copied OCR text');
 
@@ -656,7 +701,7 @@ export class ScreenshotOCRController {
             this._hideCopyMenu();
             Main.screenshotUI?.close();
         } catch (e) {
-            log(`[Shotzy OCR] Failed to open search URL: ${e.message}`);
+            console.error(`Shotzy: failed to open search URL: ${e.message}`);
         }
     }
 
@@ -693,11 +738,27 @@ export class ScreenshotOCRController {
             enabled: this._settings.get_boolean('ocr-enabled'),
             confidence: _clamp(this._settings.get_int('selection-confidence'), 0, 99),
             maxEdge: _clamp(this._settings.get_int('selection-max-edge'), 800, 4096),
-            languages: _normalizeLanguageSelection(this._settings.get_strv('ocr-languages')),
+            languages: normalizeLanguageSelection(this._settings.get_strv('ocr-languages')),
             searchEngine: this._settings.get_string('search-engine') || 'google',
             closeAfterCopy: this._settings.get_boolean('close-after-copy'),
         };
     }
+}
+
+function _onSameTextLine(a, b) {
+    const overlap = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+    return overlap > Math.min(a.height, b.height) * 0.5;
+}
+
+function _monitorForPoint(x, y) {
+    const monitor = (Main.layoutManager?.monitors ?? []).find(candidate =>
+        x >= candidate.x && x < candidate.x + candidate.width &&
+        y >= candidate.y && y < candidate.y + candidate.height);
+
+    if (monitor)
+        return monitor;
+
+    return {x: 0, y: 0, width: global.stage.width, height: global.stage.height};
 }
 
 function _rectsOverlap(a, b) {
@@ -730,73 +791,7 @@ function _parseColorSetting(value, fallback) {
 }
 
 function _buildTesseractLanguageArgument(languages) {
-    return _normalizeLanguageSelection(languages, _listInstalledTesseractLanguages()).join('+');
-}
-
-function _listInstalledTesseractLanguages() {
-    const directory = Gio.File.new_for_path(TESSDATA_DIR);
-    const languages = [];
-    let enumerator = null;
-
-    try {
-        enumerator = directory.enumerate_children(
-            'standard::name,standard::type',
-            Gio.FileQueryInfoFlags.NONE,
-            null
-        );
-
-        let info;
-        while ((info = enumerator.next_file(null)) !== null) {
-            if (info.get_file_type() !== Gio.FileType.REGULAR)
-                continue;
-
-            const name = info.get_name();
-            if (!name.endsWith('.traineddata'))
-                continue;
-
-            const code = name.slice(0, -'.traineddata'.length);
-            if (/^[A-Za-z0-9_]+$/.test(code))
-                languages.push(code);
-        }
-    } catch (_e) {
-    } finally {
-        try {
-            enumerator?.close(null);
-        } catch (_e) {
-        }
-    }
-
-    return languages.sort();
-}
-
-function _normalizeLanguageSelection(languages, installedLanguages = null) {
-    const installed = installedLanguages?.length > 0 ? new Set(installedLanguages) : null;
-    const normalized = [];
-    const seen = new Set();
-
-    if (!Array.isArray(languages))
-        languages = [];
-
-    for (const language of languages) {
-        const code = String(language).trim();
-        if (!code || !/^[A-Za-z0-9_]+$/.test(code) || seen.has(code))
-            continue;
-
-        if (installed && !installed.has(code))
-            continue;
-
-        normalized.push(code);
-        seen.add(code);
-    }
-
-    if (normalized.length > 0)
-        return normalized;
-
-    const fallback = DEFAULT_OCR.languages.find(language => !installed || installed.has(language));
-    if (fallback)
-        return [fallback];
-
-    return installedLanguages?.length > 0 ? [installedLanguages[0]] : [...DEFAULT_OCR.languages];
+    return normalizeLanguageSelection(languages, listInstalledTesseractLanguages()).join('+');
 }
 
 function _clamp(value, min, max) {
